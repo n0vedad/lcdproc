@@ -54,10 +54,10 @@ static char *tickTime(char *time, int heartbeat);
  *
  *\verbatim
  *
- * +--------------------+	+--------------------+
- * |## Linux 2.6.11 ###@|	|### TIME: myhost ##@|
- * |Up xxx days hh:mm:ss|	|17.05.2005 11:32:57a|
- * |  Wed May 17, 1998  |	+--------------------+
+ * +--------------------+ +--------------------+
+ * |## Linux 2.6.11 ###@| |### TIME: myhost ##@|
+ * |Up xxx days hh:mm:ss| |17.05.2005 11:32:57a|
+ * |  Wed May 17, 1998  | +--------------------+
  * |11:32:57a  100% idle|
  * +--------------------+
  *
@@ -71,95 +71,150 @@ static char *tickTime(char *time, int heartbeat);
 int
 time_screen(int rep, int display, int *flags_ptr)
 {
-	char now[40];
-	char today[40];
-	int xoffs;
-	int days, hour, min, sec;
-	static int heartbeat = 0;
-	static const char *timeFormat = NULL;
-	static const char *dateFormat = NULL;
-	time_t thetime;
-	struct tm *rtime;
-	double uptime, idle;
-
-	if ((*flags_ptr & INITIALIZED) == 0) {
-		*flags_ptr |= INITIALIZED;
-
-		/* get config values */
-		timeFormat = config_get_string("TimeDate", "TimeFormat", 0, "%H:%M:%S");
-		dateFormat = config_get_string("TimeDate", "DateFormat", 0, "%b %d %Y");
-
-		sock_send_string(sock, "screen_add T\n");
-		sock_printf(sock, "screen_set T -name {Time Screen: %s}\n", get_hostname());
-		sock_send_string(sock, "widget_add T title title\n");
-		sock_send_string(sock, "widget_add T one string\n");
-		if (lcd_hgt >= 4) {
-			sock_send_string(sock, "widget_add T two string\n");
-			sock_send_string(sock, "widget_add T three string\n");
-
-			/* write title bar: OS name, OS version, hostname */
-			sock_printf(sock, "widget_set T title {%s %s:%s}\n",
-				get_sysname(), get_sysrelease(), get_hostname());
-		}
-		else {
-			/* write title bar: hostname */
-			sock_printf(sock, "widget_set T title {TIME:%s}\n", get_hostname());
-		}
-	}
-
-	/* toggle colon display */
-	heartbeat ^= 1;
-
-	time(&thetime);
-	rtime = localtime(&thetime);
-
-	if (strftime(today, sizeof(today), dateFormat, rtime) == 0)
-		*today = '\0';
-	if (strftime(now, sizeof(now), timeFormat, rtime) == 0)
-		*now = '\0';
-	tickTime(now, heartbeat);
-
-	if (lcd_hgt >= 4) {
-		char tmp[40];	/* should be large enough */
-
-		machine_get_uptime(&uptime, &idle);
-
-		/* display the uptime... */
-		days = (int) uptime / 86400;
-		hour = ((int) uptime % 86400) / 3600;
-		min  = ((int) uptime % 3600) / 60;
-		sec  = ((int) uptime % 60);
-
-		if (lcd_wid >= 20)
-			sprintf(tmp, "Up %3d day%s %02d:%02d:%02d",
-				days, ((days != 1) ? "s" : ""), hour, min, sec);
-		else
-			sprintf(tmp, "Up %dd %02d:%02d:%02d", days, hour, min, sec);
-
-		xoffs = (lcd_wid > strlen(tmp)) ? ((lcd_wid - strlen(tmp)) / 2) + 1 : 1;
-		if (display)
-			sock_printf(sock, "widget_set T one %i 2 {%s}\n", xoffs, tmp);
-
-		/* display the date */
-		xoffs = (lcd_wid > strlen(today)) ? ((lcd_wid - strlen(today)) / 2) + 1 : 1;
-		if (display)
-			sock_printf(sock, "widget_set T two %i 3 {%s}\n", xoffs, today);
-
-		/* display the time & idle time... */
-		sprintf(tmp, "%s %3i%% idle", now, (int) idle);
-		xoffs = (lcd_wid > strlen(tmp)) ? ((lcd_wid - strlen(tmp)) / 2) + 1 : 1;
-		if (display)
-			sock_printf(sock, "widget_set T three %i 4 {%s}\n", xoffs, tmp);
-	}
-	else {			/* 2 line version of the screen */
-		xoffs = (lcd_wid > (strlen(today) + strlen(now) + 1))
-			? ((lcd_wid - ((strlen(today) + strlen(now) + 1))) / 2) + 1 : 1;
-		if (display)
-			sock_printf(sock, "widget_set T one %i 2 {%s %s}\n", xoffs, today, now);
-	}
-
-	return 0;
-}				/* End time_screen() */
+    /* CPU calculation buffer - using same methodology as cpu.c */
+    #define TIMESCREEN_CPU_BUF_SIZE 4
+    static double timescreen_cpu[TIMESCREEN_CPU_BUF_SIZE + 1][5]; /* [4 historical + 1 averaged][user,nice,sys,idle,total] */
+    static int cpu_data_initialized = 0;
+    
+    char now[40];
+    char today[40];
+    int xoffs;
+    int days, hour, min, sec;
+    static int heartbeat = 0;
+    static const char *timeFormat = NULL;
+    static const char *dateFormat = NULL;
+    time_t thetime;
+    struct tm *rtime;
+    double uptime;
+    load_type load;
+    int i, j;
+    
+    if ((*flags_ptr & INITIALIZED) == 0) {
+        *flags_ptr |= INITIALIZED;
+        
+        /* Initialize CPU calculation buffer (same as cpu.c approach) */
+        if (!cpu_data_initialized) {
+            for (i = 0; i <= TIMESCREEN_CPU_BUF_SIZE; i++) {
+                for (j = 0; j < 5; j++) {
+                    timescreen_cpu[i][j] = 0.0;
+                }
+            }
+            cpu_data_initialized = 1;
+        }
+        
+        /* get config values */
+        timeFormat = config_get_string("TimeDate", "TimeFormat", 0, "%H:%M:%S");
+        dateFormat = config_get_string("TimeDate", "DateFormat", 0, "%b %d %Y");
+        sock_send_string(sock, "screen_add T\n");
+        sock_printf(sock, "screen_set T -name {Time Screen: %s}\n", get_hostname());
+        sock_send_string(sock, "widget_add T title title\n");
+        sock_send_string(sock, "widget_add T one string\n");
+        if (lcd_hgt >= 4) {
+            sock_send_string(sock, "widget_add T two string\n");
+            sock_send_string(sock, "widget_add T three string\n");
+            /* write title bar: OS name, OS version, hostname */
+            sock_printf(sock, "widget_set T title {%s %s:%s}\n",
+                get_sysname(), get_sysrelease(), get_hostname());
+        }
+        else {
+            /* write title bar: hostname */
+            sock_printf(sock, "widget_set T title {TIME:%s}\n", get_hostname());
+        }
+    }
+    
+    /* 
+     * CPU Load calculation using exact same method as cpu.c
+     * This ensures consistent idle percentage across all screens
+     */
+    machine_get_load(&load);
+    
+    /* Shift values over by one (historical data management like cpu.c) */
+    for (i = 0; i < (TIMESCREEN_CPU_BUF_SIZE - 1); i++) {
+        for (j = 0; j < 5; j++) {
+            timescreen_cpu[i][j] = timescreen_cpu[i + 1][j];
+        }
+    }
+    
+    /* Read new data and calculate percentages (identical to cpu.c logic) */
+    if (load.total > 0L) {
+        timescreen_cpu[TIMESCREEN_CPU_BUF_SIZE - 1][0] = 100.0 * ((double) load.user / (double) load.total);    /* user % */
+        timescreen_cpu[TIMESCREEN_CPU_BUF_SIZE - 1][1] = 100.0 * ((double) load.system / (double) load.total);  /* system % */
+        timescreen_cpu[TIMESCREEN_CPU_BUF_SIZE - 1][2] = 100.0 * ((double) load.nice / (double) load.total);    /* nice % */
+        timescreen_cpu[TIMESCREEN_CPU_BUF_SIZE - 1][3] = 100.0 * ((double) load.idle / (double) load.total);    /* idle % */
+        timescreen_cpu[TIMESCREEN_CPU_BUF_SIZE - 1][4] = 100.0 * (((double) load.user + (double) load.system + (double) load.nice) / (double) load.total); /* total used % */
+    }
+    else {
+        /* Fallback when load.total is 0 (shouldn't happen, but safety first) */
+        timescreen_cpu[TIMESCREEN_CPU_BUF_SIZE - 1][0] = 0.0;
+        timescreen_cpu[TIMESCREEN_CPU_BUF_SIZE - 1][1] = 0.0;
+        timescreen_cpu[TIMESCREEN_CPU_BUF_SIZE - 1][2] = 0.0;
+        timescreen_cpu[TIMESCREEN_CPU_BUF_SIZE - 1][3] = 0.0;
+        timescreen_cpu[TIMESCREEN_CPU_BUF_SIZE - 1][4] = 0.0;
+    }
+    
+    /* Average values over the buffer for smooth, stable results (like cpu.c) */
+    for (i = 0; i < 5; i++) {
+        double value = 0.0;
+        for (j = 0; j < TIMESCREEN_CPU_BUF_SIZE; j++) {
+            value += timescreen_cpu[j][i];
+        }
+        value /= TIMESCREEN_CPU_BUF_SIZE;
+        timescreen_cpu[TIMESCREEN_CPU_BUF_SIZE][i] = value; /* Store averaged result */
+    }
+    
+    /* toggle colon display */
+    heartbeat ^= 1;
+    time(&thetime);
+    rtime = localtime(&thetime);
+    if (strftime(today, sizeof(today), dateFormat, rtime) == 0)
+        *today = '\0';
+    if (strftime(now, sizeof(now), timeFormat, rtime) == 0)
+        *now = '\0';
+    tickTime(now, heartbeat);
+    
+    if (lcd_hgt >= 4) {
+        char tmp[40]; /* should be large enough */
+        
+        /* Get uptime for time calculation only (not for idle calculation) */
+        machine_get_uptime(&uptime, NULL);
+        
+        /* display the uptime... */
+        days = (int) uptime / 86400;
+        hour = ((int) uptime % 86400) / 3600;
+        min  = ((int) uptime % 3600) / 60;
+        sec  = ((int) uptime % 60);
+        if (lcd_wid >= 20)
+            sprintf(tmp, "Up %3d day%s %02d:%02d:%02d",
+                days, ((days != 1) ? "s" : ""), hour, min, sec);
+        else
+            sprintf(tmp, "Up %dd %02d:%02d:%02d", days, hour, min, sec);
+        xoffs = (lcd_wid > strlen(tmp)) ? ((lcd_wid - strlen(tmp)) / 2) + 1 : 1;
+        if (display)
+            sock_printf(sock, "widget_set T one %i 2 {%s}\n", xoffs, tmp);
+        
+        /* display the date */
+        xoffs = (lcd_wid > strlen(today)) ? ((lcd_wid - strlen(today)) / 2) + 1 : 1;
+        if (display)
+            sock_printf(sock, "widget_set T two %i 3 {%s}\n", xoffs, today);
+        
+        /* 
+         * Display time & idle percentage using our averaged CPU calculation
+         * This will now match the CPU screen's idle percentage exactly
+         */
+        sprintf(tmp, "%s %3i%% idle", now, (int) timescreen_cpu[TIMESCREEN_CPU_BUF_SIZE][3]);
+        xoffs = (lcd_wid > strlen(tmp)) ? ((lcd_wid - strlen(tmp)) / 2) + 1 : 1;
+        if (display)
+            sock_printf(sock, "widget_set T three %i 4 {%s}\n", xoffs, tmp);
+    }
+    else { /* 2 line version of the screen */
+        xoffs = (lcd_wid > (strlen(today) + strlen(now) + 1))
+            ? ((lcd_wid - ((strlen(today) + strlen(now) + 1))) / 2) + 1 : 1;
+        if (display)
+            sock_printf(sock, "widget_set T one %i 2 {%s %s}\n", xoffs, today, now);
+    }
+    
+    return 0;
+} /* End time_screen() */
 
 
 /**
